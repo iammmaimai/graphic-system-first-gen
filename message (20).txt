@@ -1,0 +1,331 @@
+`default_nettype none
+
+// Tiny Tapeout VGA bullet-hell demo.
+// ui_in[0]=up, [1]=down, [2]=left, [3]=right, [4]=restart
+module tt_um_vga_example #(
+    // VGA Playground supplies a pixel-rate clock, so leave this at 1 there.
+    // A 100 MHz FPGA board wrapper should override it with PIXEL_DIV=4.
+    parameter integer PIXEL_DIV = 1,
+    // VGA Playground usually simulates this design at about 35-36 real FPS.
+    // The Basys 3 wrapper overrides this with 60 for hardware operation.
+    parameter integer TIMER_FRAMES_PER_SECOND = 36
+) (
+    input  wire [7:0] ui_in,
+    output wire [7:0] uo_out,
+    input  wire [7:0] uio_in,
+    output wire [7:0] uio_out,
+    output wire [7:0] uio_oe,
+    input  wire       ena,
+    input  wire       clk,
+    input  wire       rst_n
+);
+    wire reset = ~rst_n;
+
+    assign uio_out = 8'b0;
+    assign uio_oe  = 8'b0;
+
+    // Synchronize the external buttons into the pixel-clock domain.
+    reg [4:0] buttons_meta;
+    reg [4:0] buttons;
+    always @(posedge clk or posedge reset) begin
+        if (reset) begin
+            buttons_meta <= 5'b0;
+            buttons      <= 5'b0;
+        end else begin
+            buttons_meta <= ui_in[4:0];
+            buttons      <= buttons_meta;
+        end
+    end
+
+    // Clock-enable divider: no fabric-generated clock is used.  RGB and sync
+    // remain stable for PIXEL_DIV input-clock cycles per VGA pixel.
+    reg [7:0] pixel_div_count;
+    wire pixel_tick = (pixel_div_count == PIXEL_DIV-1);
+    always @(posedge clk or posedge reset) begin
+        if (reset || pixel_tick)
+            pixel_div_count <= 0;
+        else
+            pixel_div_count <= pixel_div_count + 1'b1;
+    end
+
+    wire hsync, vsync, video_on, frame_tick;
+    wire [9:0] px, py;
+    wire [9:0] player_x, player_y;
+    wire [9:0] boss_x, boss_y;
+    wire [9:0] b0_x, b0_y, b1_x, b1_y, b2_x, b2_y, b3_x, b3_y;
+    wire [9:0] survival_seconds;
+    wire game_over;
+    wire [1:0] red, green, blue;
+
+    vga_sync sync_inst (
+        .clk(clk), .reset(reset), .pixel_tick(pixel_tick),
+        .hsync(hsync), .vsync(vsync),
+        .video_on(video_on), .frame_tick(frame_tick),
+        .pixel_x(px), .pixel_y(py)
+    );
+
+    game_logic #(
+        .TIMER_FRAMES_PER_SECOND(TIMER_FRAMES_PER_SECOND)
+    ) logic_inst (
+        .clk(clk), .reset(reset), .frame_tick(frame_tick),
+        .btn_up(buttons[0]), .btn_down(buttons[1]),
+        .btn_left(buttons[2]), .btn_right(buttons[3]),
+        .btn_restart(buttons[4]),
+        .player_x(player_x), .player_y(player_y),
+        .boss_x(boss_x), .boss_y(boss_y),
+        .b0_x(b0_x), .b0_y(b0_y), .b1_x(b1_x), .b1_y(b1_y),
+        .b2_x(b2_x), .b2_y(b2_y), .b3_x(b3_x), .b3_y(b3_y),
+        .survival_seconds(survival_seconds), .game_over(game_over)
+    );
+
+    pixel_gen gen_inst (
+        .video_on(video_on), .pixel_x(px), .pixel_y(py),
+        .player_x(player_x), .player_y(player_y),
+        .boss_x(boss_x), .boss_y(boss_y),
+        .b0_x(b0_x), .b0_y(b0_y), .b1_x(b1_x), .b1_y(b1_y),
+        .b2_x(b2_x), .b2_y(b2_y), .b3_x(b3_x), .b3_y(b3_y),
+        .survival_seconds(survival_seconds), .game_over(game_over),
+        .r(red), .g(green), .b(blue)
+    );
+
+    assign uo_out = {hsync, blue[0], green[0], red[0],
+                     vsync, blue[1], green[1], red[1]};
+
+    // Intentionally unused by this design.
+    wire _unused = &{ena, uio_in, ui_in[7:5], 1'b0};
+endmodule
+
+module vga_sync (
+    input wire clk, input wire reset, input wire pixel_tick,
+    output wire hsync, output wire vsync, output wire video_on,
+    output wire frame_tick,
+    output wire [9:0] pixel_x, output wire [9:0] pixel_y
+);
+    localparam HD=640, HF=16, HB=48, HR=96;
+    localparam VD=480, VF=10, VB=33, VR=2;
+    reg [9:0] h_count, v_count;
+
+    always @(posedge clk or posedge reset) begin
+        if (reset) begin
+            h_count <= 0;
+            v_count <= 0;
+        end else if (pixel_tick && h_count == HD+HF+HB+HR-1) begin
+            h_count <= 0;
+            if (v_count == VD+VF+VB+VR-1) v_count <= 0;
+            else v_count <= v_count + 1'b1;
+        end else if (pixel_tick) begin
+            h_count <= h_count + 1'b1;
+        end
+    end
+
+    assign hsync    = ~(h_count >= HD+HF && h_count < HD+HF+HR);
+    assign vsync    = ~(v_count >= VD+VF && v_count < VD+VF+VR);
+    assign video_on = h_count < HD && v_count < VD;
+    // One pixel-clock pulse at the end of every complete VGA frame.
+    assign frame_tick = pixel_tick &&
+                        (h_count == HD+HF+HB+HR-1) &&
+                        (v_count == VD+VF+VB+VR-1);
+    assign pixel_x  = h_count;
+    assign pixel_y  = v_count;
+endmodule
+
+module game_logic #(
+    parameter integer TIMER_FRAMES_PER_SECOND = 36
+) (
+    input wire clk, input wire reset, input wire frame_tick,
+    input wire btn_up, btn_down, btn_left, btn_right, btn_restart,
+    output reg [9:0] player_x, player_y,
+    output reg [9:0] boss_x, boss_y,
+    output reg [9:0] b0_x, b0_y, b1_x, b1_y,
+    output reg [9:0] b2_x, b2_y, b3_x, b3_y,
+    output reg [9:0] survival_seconds,
+    output reg game_over
+);
+    localparam PLAYER_SIZE = 16;
+    localparam BULLET_WIDTH=3, BULLET_HEIGHT=10;
+    reg boss_right;
+    reg [5:0] second_frames;
+
+    // A deliberately small 6x6 hitbox at the center of the 16x16 player.
+    wire [9:0] hit_x = player_x + 10'd5;
+    wire [9:0] hit_y = player_y + 10'd5;
+    wire hit_0 = hit_x < b0_x+BULLET_WIDTH && hit_x+6 > b0_x &&
+                 hit_y < b0_y+BULLET_HEIGHT && hit_y+6 > b0_y;
+    wire hit_1 = hit_x < b1_x+BULLET_WIDTH && hit_x+6 > b1_x &&
+                 hit_y < b1_y+BULLET_HEIGHT && hit_y+6 > b1_y;
+    wire hit_2 = hit_x < b2_x+BULLET_WIDTH && hit_x+6 > b2_x &&
+                 hit_y < b2_y+BULLET_HEIGHT && hit_y+6 > b2_y;
+    wire hit_3 = hit_x < b3_x+BULLET_WIDTH && hit_x+6 > b3_x &&
+                 hit_y < b3_y+BULLET_HEIGHT && hit_y+6 > b3_y;
+
+    always @(posedge clk or posedge reset) begin
+        if (reset || btn_restart) begin
+            player_x <= 10'd312;
+            player_y <= 10'd420;
+            boss_x <= 10'd288;
+            boss_y <= 10'd28;
+            boss_right <= 1'b1;
+            b0_x <= 10'd120; b0_y <= 10'd105;
+            b1_x <= 10'd260; b1_y <= 10'd165;
+            b2_x <= 10'd400; b2_y <= 10'd225;
+            b3_x <= 10'd520; b3_y <= 10'd285;
+            second_frames <= 6'd0;
+            survival_seconds <= 10'd0;
+            game_over <= 1'b0;
+        end else if (frame_tick && !game_over) begin
+            // Opposite directions cancel each other.
+            if (btn_up && !btn_down && player_y >= 4)
+                player_y <= player_y - 4;
+            else if (btn_down && !btn_up && player_y <= 480-PLAYER_SIZE-4)
+                player_y <= player_y + 4;
+            if (btn_left && !btn_right && player_x >= 4)
+                player_x <= player_x - 4;
+            else if (btn_right && !btn_left && player_x <= 640-PLAYER_SIZE-4)
+                player_x <= player_x + 4;
+
+            // Rocket boss sweeps across the top of the arena.
+            if (boss_right) begin
+                if (boss_x >= 10'd560) boss_right <= 1'b0;
+                else boss_x <= boss_x + 2;
+            end else begin
+                if (boss_x <= 10'd16) boss_right <= 1'b1;
+                else boss_x <= boss_x - 2;
+            end
+
+            // Four simple streams. Their X positions follow offsets from the boss
+            // whenever they wrap, making the rocket appear to fire them.
+            if (b0_y >= 480) begin b0_y <= 100; b0_x <= boss_x+8;  end
+            else b0_y <= b0_y + 5;
+            if (b1_y >= 480) begin b1_y <= 100; b1_x <= boss_x+24; end
+            else b1_y <= b1_y + 7;
+            if (b2_y >= 480) begin b2_y <= 100; b2_x <= boss_x+40; end
+            else b2_y <= b2_y + 4;
+            if (b3_y >= 480) begin b3_y <= 100; b3_x <= boss_x+56; end
+            else b3_y <= b3_y + 6;
+
+            if (second_frames == TIMER_FRAMES_PER_SECOND-1) begin
+                second_frames <= 0;
+                if (survival_seconds < 999)
+                    survival_seconds <= survival_seconds + 1'b1;
+            end else begin
+                second_frames <= second_frames + 1'b1;
+            end
+
+            if (hit_0 || hit_1 || hit_2 || hit_3)
+                game_over <= 1'b1;
+        end
+    end
+endmodule
+
+module pixel_gen (
+    input wire video_on,
+    input wire [9:0] pixel_x, pixel_y,
+    input wire [9:0] player_x, player_y,
+    input wire [9:0] boss_x, boss_y,
+    input wire [9:0] b0_x, b0_y, b1_x, b1_y,
+    input wire [9:0] b2_x, b2_y, b3_x, b3_y,
+    input wire [9:0] survival_seconds,
+    input wire game_over,
+    output reg [1:0] r, g, b
+);
+    localparam BULLET_WIDTH=3, BULLET_HEIGHT=10;
+    wire signed [20:0] player_dx =
+      $signed({10'b0, pixel_x}) - $signed({10'b0, player_x + 10'd8});
+    wire signed [20:0] player_dy =
+      $signed({10'b0, pixel_y}) - $signed({10'b0, player_y + 10'd8});
+    wire is_player =
+      (player_dx * player_dx) +
+      (player_dy * player_dy) <= 11'd64;
+    wire player_core =
+      (player_dx * player_dx) +
+      (player_dy * player_dy) <= 11'd9;
+    wire is_bullet =
+        (pixel_x>=b0_x && pixel_x<b0_x+BULLET_WIDTH && pixel_y>=b0_y && pixel_y<b0_y+BULLET_HEIGHT) ||
+        (pixel_x>=b1_x && pixel_x<b1_x+BULLET_WIDTH && pixel_y>=b1_y && pixel_y<b1_y+BULLET_HEIGHT) ||
+        (pixel_x>=b2_x && pixel_x<b2_x+BULLET_WIDTH && pixel_y>=b2_y && pixel_y<b2_y+BULLET_HEIGHT) ||
+        (pixel_x>=b3_x && pixel_x<b3_x+BULLET_WIDTH && pixel_y>=b3_y && pixel_y<b3_y+BULLET_HEIGHT);
+
+    // Rocket equation in local coordinates (rx, ry), occupying 80x80 pixels.
+    wire [9:0] rx = pixel_x - boss_x;
+    wire [9:0] ry = pixel_y - boss_y;
+    wire boss_box = pixel_x >= boss_x && pixel_x < boss_x+80 &&
+                    pixel_y >= boss_y && pixel_y < boss_y+80;
+    // Pointed nose: width grows by one pixel per row toward the body.
+    wire rocket_nose = boss_box && ry < 24 && rx >= 40-ry && rx <= 40+ry;
+    wire rocket_body = boss_box && ry >= 20 && ry < 62 && rx >= 20 && rx < 61;
+    wire rocket_window = boss_box && ry >= 29 && ry < 43 && rx >= 33 && rx < 47;
+    // Fins are triangular inequalities, also made only from comparisons/addition.
+    wire rocket_left_fin  = boss_box && ry >= 46 && ry < 68 && rx < 21 && rx+ry >= 57;
+    wire rocket_right_fin = boss_box && ry >= 46 && ry < 68 && rx > 59 && rx <= ry+25;
+    wire rocket_flame = boss_box && ry >= 62 && ry < 80 &&
+                        rx >= 32+(ry-62)/3 && rx <= 48-(ry-62)/3;
+    wire rocket_shape = rocket_nose || rocket_body || rocket_left_fin || rocket_right_fin;
+
+    wire [3:0] hundreds = survival_seconds / 100;
+    wire [3:0] tens     = (survival_seconds / 10) % 10;
+    wire [3:0] ones     = survival_seconds % 10;
+
+    function [6:0] segments;
+        input [3:0] digit;
+        begin
+            case (digit)
+                0: segments=7'b1111110; 1: segments=7'b0110000;
+                2: segments=7'b1101101; 3: segments=7'b1111001;
+                4: segments=7'b0110011; 5: segments=7'b1011011;
+                6: segments=7'b1011111; 7: segments=7'b1110000;
+                8: segments=7'b1111111; 9: segments=7'b1111011;
+                default: segments=7'b0000000;
+            endcase
+        end
+    endfunction
+
+    function digit_pixel;
+        input [3:0] digit;
+        input [9:0] x;
+        input [9:0] y;
+        reg [6:0] s;
+        begin
+            s=segments(digit);
+            digit_pixel =
+                (s[6] && y<3  && x>=3 && x<13) ||
+                (s[5] && x>=13 && y>=3 && y<15) ||
+                (s[4] && x>=13 && y>=17 && y<29) ||
+                (s[3] && y>=29 && x>=3 && x<13) ||
+                (s[2] && x<3 && y>=17 && y<29) ||
+                (s[1] && x<3 && y>=3 && y<15) ||
+                (s[0] && y>=14 && y<18 && x>=3 && x<13);
+        end
+    endfunction
+
+    wire timer_area = pixel_y>=12 && pixel_y<44 && pixel_x>=568 && pixel_x<624;
+    wire timer_pixel = timer_area && (
+        (pixel_x<584 && digit_pixel(hundreds,pixel_x-568,pixel_y-12)) ||
+        (pixel_x>=588 && pixel_x<604 && digit_pixel(tens,pixel_x-588,pixel_y-12)) ||
+        (pixel_x>=608 && digit_pixel(ones,pixel_x-608,pixel_y-12)));
+
+    always @(*) begin
+        if (!video_on) begin
+            r=0; g=0; b=0;
+        end else if (game_over) begin
+            // Preserve the final time in white over the red game-over screen.
+            if (timer_pixel) begin r=3; g=3; b=3; end
+            else begin r=3; g=0; b=0; end
+        end else if (timer_pixel || player_core) begin
+            r=3; g=3; b=3;
+        end else if (is_player) begin
+            r=0; g=3; b=1;
+        end else if (rocket_window) begin
+            r=0; g=3; b=3;
+        end else if (rocket_flame) begin
+            r=3; g=2; b=0;
+        end else if (rocket_shape) begin
+            r=2; g=2; b=3;
+        end else if (is_bullet) begin
+            r=3; g=0; b=1;
+        end else begin
+            r=0; g=0; b=1;
+        end
+    end
+endmodule
+
+`default_nettype wire
