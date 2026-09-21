@@ -1,6 +1,6 @@
-# tiny tapeout vga bullet hell demo
+# first gen vga bullet hell demo
 
-this is a simple bullet hell mini game made in verilog for tiny tapeout. you control a little player trying to dodge bullets coming down from a rocket boss moving side to side at the top.
+this is a simple bullet hell mini game made in verilog for tiny tapeout. you control a player trying to dodge bullets coming down from a rocket boss moving side to side at the top.
 
 there is a timer on the top right counting how many seconds you survive. if you get hit, screen turns red and game over.
 
